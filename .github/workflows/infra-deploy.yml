@@ -1,0 +1,113 @@
+# ============================================================
+# GitHub Actions workflow: Deploy Unity Catalog infrastructure
+# Runs Terraform to provision catalog, schema, and volume
+# State is stored in a Databricks UC Volume
+# ============================================================
+
+name: Deploy Infrastructure
+
+on:
+  # Manual trigger with environment selection
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+
+  # Auto-trigger on push to dev branch
+  push:
+    branches: [dev]
+    paths:
+      - 'infra/**'
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform Deploy (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+
+    env:
+      TF_VAR_databricks_host: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      STATE_VOLUME_PATH: /Volumes/gharchive_terraform/tf_state/files
+
+    defaults:
+      run:
+        working-directory: infra/
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      # ---------------------------------------------------
+      # Download Terraform state from Databricks Volume
+      # ---------------------------------------------------
+      - name: Download Terraform state
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          STATE_FILE="${STATE_VOLUME_PATH}/terraform-${ENV}.tfstate"
+          echo "Downloading state from ${STATE_FILE}..."
+
+          HTTP_CODE=$(curl -s -o terraform.tfstate -w "%{http_code}" \
+            -X GET \
+            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            "${DATABRICKS_HOST}/api/2.0/fs/files${STATE_FILE}")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "State file downloaded successfully."
+          elif [ "$HTTP_CODE" = "404" ]; then
+            echo "No existing state file found. Starting fresh."
+            rm -f terraform.tfstate
+          else
+            echo "Warning: Unexpected HTTP code ${HTTP_CODE}. Starting fresh."
+            rm -f terraform.tfstate
+          fi
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          terraform plan -var-file=${ENV}.tfvars -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      # ---------------------------------------------------
+      # Upload Terraform state back to Databricks Volume
+      # ---------------------------------------------------
+      - name: Upload Terraform state
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          STATE_FILE="${STATE_VOLUME_PATH}/terraform-${ENV}.tfstate"
+          echo "Uploading state to ${STATE_FILE}..."
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X PUT \
+            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @terraform.tfstate \
+            "${DATABRICKS_HOST}/api/2.0/fs/files${STATE_FILE}")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "State file uploaded successfully."
+          else
+            echo "ERROR: Failed to upload state. HTTP code: ${HTTP_CODE}"
+            exit 1
+          fi
