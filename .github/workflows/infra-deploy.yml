@@ -2,6 +2,7 @@
 # GitHub Actions workflow: Deploy Unity Catalog infrastructure
 # Runs Terraform to provision catalog, schema, and volume
 # State is stored in a Databricks UC Volume
+# Auth: OAuth M2M (service principal client credentials)
 # ============================================================
 
 name: Deploy Infrastructure
@@ -33,9 +34,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      TF_VAR_databricks_host: ${{ secrets.DATABRICKS_HOST }}
+      # Terraform provider auto-detects these env vars for OAuth M2M
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      TF_VAR_databricks_host: ${{ secrets.DATABRICKS_HOST }}
       STATE_VOLUME_PATH: /Volumes/gharchive_terraform/tf_state/files
 
     defaults:
@@ -52,6 +55,30 @@ jobs:
           terraform_version: 1.5.0
 
       # ---------------------------------------------------
+      # Get OAuth token for Databricks API calls (state mgmt)
+      # ---------------------------------------------------
+      - name: Get OAuth access token
+        run: |
+          RESPONSE=$(curl -s -X POST \
+            "${DATABRICKS_HOST}/oidc/v1/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${DATABRICKS_CLIENT_ID}" \
+            -d "client_secret=${DATABRICKS_CLIENT_SECRET}" \
+            -d "scope=all-apis")
+
+          ACCESS_TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "ERROR: Failed to get OAuth token. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+          echo "OAuth token obtained successfully."
+
+      # ---------------------------------------------------
       # Download Terraform state from Databricks Volume
       # ---------------------------------------------------
       - name: Download Terraform state
@@ -62,7 +89,7 @@ jobs:
 
           HTTP_CODE=$(curl -s -o terraform.tfstate -w "%{http_code}" \
             -X GET \
-            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             "${DATABRICKS_HOST}/api/2.0/fs/files${STATE_FILE}")
 
           if [ "$HTTP_CODE" = "200" ]; then
@@ -100,7 +127,7 @@ jobs:
 
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -X PUT \
-            -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @terraform.tfstate \
             "${DATABRICKS_HOST}/api/2.0/fs/files${STATE_FILE}")
