@@ -41,9 +41,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ---------------------------------------------------
-      # Get OAuth access token
-      # ---------------------------------------------------
       - name: Get OAuth access token
         run: |
           RESPONSE=$(curl -s -X POST \
@@ -54,10 +51,11 @@ jobs:
             -d "client_secret=${DATABRICKS_CLIENT_SECRET}" \
             -d "scope=all-apis")
 
-          ACCESS_TOKEN=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])" 2>/dev/null)
+          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
 
           if [ -z "$ACCESS_TOKEN" ]; then
-            echo "ERROR: Failed to get OAuth token. Response: $RESPONSE"
+            echo "ERROR: Failed to get OAuth token."
+            echo "$RESPONSE" | jq .
             exit 1
           fi
 
@@ -65,12 +63,9 @@ jobs:
           echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
           echo "OAuth token obtained successfully."
 
-      # ---------------------------------------------------
-      # Execute SQL setup script
-      # ---------------------------------------------------
-      - name: Run SQL setup
+      - name: Execute SQL setup
         run: |
-          ENV=${{ github.event.inputs.environment || 'dev' }}
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
           SQL_FILE="infra/setup-${ENV}.sql"
 
           if [ ! -f "$SQL_FILE" ]; then
@@ -80,44 +75,40 @@ jobs:
 
           echo "Running SQL from: $SQL_FILE"
 
-          # Read file, remove comments and blank lines, split by semicolons
-          STATEMENTS=$(sed 's/--.*$//' "$SQL_FILE" | tr '\n' ' ' | sed 's/;/;\n/g')
-
-          echo "$STATEMENTS" | while IFS= read -r stmt; do
-            # Skip empty statements
-            TRIMMED=$(echo "$stmt" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | sed 's/;$//')
-            if [ -z "$TRIMMED" ]; then
+          # Remove comments, blank lines, split by semicolons into individual statements
+          sed 's/--.*$//' "$SQL_FILE" | tr '\n' ' ' | sed 's/;/;\n/g' | while IFS= read -r raw_stmt; do
+            STMT=$(echo "$raw_stmt" | xargs | sed 's/;$//')
+            if [ -z "$STMT" ]; then
               continue
             fi
 
             echo "------------------------------------------"
-            echo "Executing: $TRIMMED"
+            echo "Executing: $STMT"
             echo "------------------------------------------"
+
+            # Build JSON payload using jq
+            PAYLOAD=$(jq -n \
+              --arg wid "$WAREHOUSE_ID" \
+              --arg sql "$STMT" \
+              '{warehouse_id: $wid, statement: $sql, wait_timeout: "30s"}')
 
             RESPONSE=$(curl -s -X POST \
               "${DATABRICKS_HOST}/api/2.0/sql/statements" \
               -H "Authorization: Bearer ${ACCESS_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d "$(python3 -c "
-import json, sys
-print(json.dumps({
-    'warehouse_id': '${{ env.WAREHOUSE_ID }}',
-    'statement': '''${TRIMMED}''',
-    'wait_timeout': '30s'
-}))
-")")
+              -d "$PAYLOAD")
 
-            STATE=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',{}).get('state','UNKNOWN'))" 2>/dev/null)
-            
+            STATE=$(echo "$RESPONSE" | jq -r '.status.state // "UNKNOWN"')
+
             if [ "$STATE" = "SUCCEEDED" ]; then
               echo "SUCCESS"
             elif [ "$STATE" = "FAILED" ]; then
-              ERROR=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',{}).get('error',{}).get('message','Unknown error'))" 2>/dev/null)
+              ERROR=$(echo "$RESPONSE" | jq -r '.status.error.message // "Unknown error"')
               echo "FAILED: $ERROR"
               exit 1
             else
               echo "WARNING: Unexpected state: $STATE"
-              echo "Response: $RESPONSE"
+              echo "$RESPONSE" | jq .
             fi
           done
 
