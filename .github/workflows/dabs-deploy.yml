@@ -1,0 +1,81 @@
+# ============================================================
+# GitHub Actions workflow: Deploy pipelines & jobs via DABs
+# Uses Databricks CLI with OAuth M2M authentication
+# ============================================================
+
+name: Deploy DABs Bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+      run_pipeline:
+        description: 'Run V3 pipeline after deploy?'
+        required: false
+        type: boolean
+        default: false
+
+  push:
+    branches: [dev]
+    paths:
+      - 'src/**'
+      - 'databricks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy Bundle (${{ github.event.inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------
+      # Install Databricks CLI
+      # ---------------------------------------------------
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          databricks --version
+
+      # ---------------------------------------------------
+      # Validate bundle configuration
+      # ---------------------------------------------------
+      - name: Validate bundle
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          echo "Validating bundle for target: ${ENV}"
+          databricks bundle validate -t "${ENV}"
+
+      # ---------------------------------------------------
+      # Deploy bundle (pipelines, jobs, notebooks)
+      # ---------------------------------------------------
+      - name: Deploy bundle
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          echo "Deploying bundle to target: ${ENV}"
+          databricks bundle deploy -t "${ENV}"
+
+      # ---------------------------------------------------
+      # Optionally run the V3 Auto Loader pipeline
+      # ---------------------------------------------------
+      - name: Run V3 pipeline
+        if: github.event.inputs.run_pipeline == 'true'
+        run: |
+          ENV=${{ github.event.inputs.environment || 'dev' }}
+          echo "Running V3 Auto Loader pipeline on target: ${ENV}"
+          databricks bundle run -t "${ENV}" gharchive_v3_autoloader

@@ -1,6 +1,7 @@
 # ============================================================
 # GitHub Actions workflow: Deploy Unity Catalog infrastructure
-# Executes SQL via Databricks SQL Statement Execution API
+# 1. Executes SQL via Databricks SQL Statement Execution API
+# 2. Grants workspace-level permissions via Terraform local-exec
 # Auth: OAuth M2M (service principal client credentials)
 # ============================================================
 
@@ -21,7 +22,7 @@ on:
     branches: [dev]
     paths:
       - 'infra/**'
-      - '.github/workflows/**'
+      - '.github/workflows/infra-deploy.yml'
 
 permissions:
   contents: read
@@ -41,6 +42,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ---------------------------------------------------
+      # Step 1: Get OAuth access token
+      # ---------------------------------------------------
       - name: Get OAuth access token
         run: |
           RESPONSE=$(curl -s -X POST \
@@ -63,6 +67,9 @@ jobs:
           echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
           echo "OAuth token obtained successfully."
 
+      # ---------------------------------------------------
+      # Step 2: Execute SQL setup (catalogs, schemas, volumes, grants)
+      # ---------------------------------------------------
       - name: Execute SQL setup
         run: |
           ENV="${{ github.event.inputs.environment || 'dev' }}"
@@ -75,7 +82,6 @@ jobs:
 
           echo "Running SQL from: $SQL_FILE"
 
-          # Remove comments, blank lines, split by semicolons into individual statements
           sed 's/--.*$//' "$SQL_FILE" | tr '\n' ' ' | sed 's/;/;\n/g' | while IFS= read -r raw_stmt; do
             STMT=$(echo "$raw_stmt" | xargs | sed 's/;$//')
             if [ -z "$STMT" ]; then
@@ -86,7 +92,6 @@ jobs:
             echo "Executing: $STMT"
             echo "------------------------------------------"
 
-            # Build JSON payload using jq
             PAYLOAD=$(jq -n \
               --arg wid "$WAREHOUSE_ID" \
               --arg sql "$STMT" \
@@ -113,3 +118,21 @@ jobs:
           done
 
           echo "All SQL statements executed successfully."
+
+      # ---------------------------------------------------
+      # Step 3: Grant workspace-level permissions via SCIM API
+      # (Terraform local-exec in infra/workspace/ subfolder)
+      # Runs in infra/workspace/ to avoid picking up old .tf files
+      # ---------------------------------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Grant workspace permissions
+        working-directory: infra/workspace/
+        run: |
+          terraform init
+          terraform apply -auto-approve \
+            -var="databricks_host=${DATABRICKS_HOST}" \
+            -var="service_principal_id=13713ce5-dcb8-4a71-be94-28b533c10461"
