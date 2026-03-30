@@ -23,7 +23,7 @@ variable "catalog_name" {
 }
 
 variable "schema_name" {
-  description = "Name of the schema within the catalog"
+  description = "Legacy: single schema name (kept for backward compat). Individual schemas are now defined in main.tf."
   type        = string
   default     = "pipeline"
 }
@@ -32,4 +32,9 @@ variable "volume_name" {
   description = "Name of the managed volume for raw files"
   type        = string
   default     = "raw_files"
+}
+
+variable "pipeline_runner_principal" {
+  description = "The user or service principal that runs pipelines. Needs CREATE_MATERIALIZED_VIEW for DLT schemas."
+  type        = string
 }
